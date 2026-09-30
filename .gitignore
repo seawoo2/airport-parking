@@ -14,10 +14,13 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+test_environment.ipynb
 
 # Data
 data/raw/
 data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
 
 # Local database / temporary files
 *.sqlite
@@ -29,6 +32,7 @@ data/processed/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Logs
 *.log
