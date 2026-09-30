@@ -11,6 +11,7 @@ env/
 # Environment variables / secrets
 .env
 .env.*
+!.env.example
 
 # Jupyter
 .ipynb_checkpoints/
@@ -37,3 +38,7 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+
+# Local-only
+local-work/

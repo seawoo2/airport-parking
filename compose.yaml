@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:17
+    container_name: airport-parking-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: airport_parking
+      POSTGRES_USER: airport_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD를 .env에 설정하세요}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airport_app -d airport_parking"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
