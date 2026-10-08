@@ -16,7 +16,7 @@ class ParkingObservation:
 
 
 def normalize_parking_item(item: dict) -> ParkingObservation:
-    """Keep provider values; reject records whose meaning is unclear."""
+    """Keep provider values, including occupancy above reported capacity."""
     try:
         lot_name = str(item["floor"]).strip()
         occupied = int(item["parking"])
@@ -24,7 +24,7 @@ def normalize_parking_item(item: dict) -> ParkingObservation:
         observed = datetime.strptime(str(item["datetm"]), "%Y%m%d%H%M%S.%f")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"주차 데이터 필드가 올바르지 않습니다: {item!r}") from exc
-    if not lot_name or occupied < 0 or total < 0 or (total > 0 and occupied > total):
+    if not lot_name or occupied < 0 or total < 0:
         raise ValueError(f"주차 데이터 값이 범위를 벗어났습니다: {item!r}")
     return ParkingObservation(
         lot_name=lot_name,
