@@ -44,6 +44,10 @@ uv run airport-parking --help
 
 원본 및 가공 데이터는 저장소에 커밋하지 않습니다. 필요한 데이터는 `data/raw/`와 `data/processed/`에 로컬로 저장하세요.
 
+서버에서 수집하고 로컬에서 분석하는 경우 [서버 데이터 동기화 안내](docs/SERVER_DATA_SYNC.md)에 따라 SSH로 신규 행만 내려받고 Windows 예약 작업을 등록할 수 있습니다. 로컬 SQLite에 누적하고, `scripts/materialize-server-data.py`로 전체 분석용 CSV를 조립합니다. 기존 전체 다운로드는 최초 실행 때 자동으로 가져옵니다.
+
+최신 데이터를 기반으로 1시간 후 주차 혼잡도를 예측하고 시간 순서로 평가하려면 [혼잡도 모델 안내](docs/CONGESTION_MODEL.md)를 참고하세요. 로컬에서 `.venv\Scripts\python.exe -m airport_parking.models.congestion train`을 실행합니다. 학습과 평가는 최종 성공 동기화가 1시간 이상 지났으면 먼저 증분 동기화하고, 전체 로컬 데이터셋을 조립합니다. 데이터가 부족하면 학습 성능을 만들지 않고 현재값 유지 기준 예측과 품질 보고서를 생성합니다.
+
 ## 주차 현황 수집
 
 [공공데이터포털의 인천국제공항공사 주차 정보 API](https://www.data.go.kr/data/15095047/openapi.do)에 활용신청을 하고, 발급된 서비스키를 `.env`의 `AIRPORT_PARKING_SERVICE_KEY`에 설정합니다. 일반 인증키와 인코딩된 인증키 모두 입력할 수 있습니다. 나머지 DB 접속 항목은 [.env.example](.env.example)을 참고하세요. `.env`는 Git에 포함되지 않습니다.
