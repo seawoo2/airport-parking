@@ -48,6 +48,8 @@ uv run airport-parking --help
 
 최신 데이터를 기반으로 1시간 후 주차 혼잡도를 예측하고 시간 순서로 평가하려면 [혼잡도 모델 안내](docs/CONGESTION_MODEL.md)를 참고하세요. 로컬에서 `.venv\Scripts\python.exe -m airport_parking.models.congestion train`을 실행합니다. 학습과 평가는 최종 성공 동기화가 1시간 이상 지났으면 먼저 증분 동기화하고, 전체 로컬 데이터셋을 조립합니다. 데이터가 부족하면 학습 성능을 만들지 않고 현재값 유지 기준 예측과 품질 보고서를 생성합니다.
 
+최종 목표인 익일 시간대별 예측은 [익일 예측·일별 평가 안내](docs/NEXT_DAY_FORECAST.md)를 사용합니다. 서버 17:10 익일 승객예고 수집과 로컬 17:10 동기화, 17:15 예측, 00:10 전날 확정 평가를 연결합니다. 평균·최대·최소 혼잡도를 각각 예측·평가합니다.
+
 ## 주차 현황 수집
 
 [공공데이터포털의 인천국제공항공사 주차 정보 API](https://www.data.go.kr/data/15095047/openapi.do)에 활용신청을 하고, 발급된 서비스키를 `.env`의 `AIRPORT_PARKING_SERVICE_KEY`에 설정합니다. 일반 인증키와 인코딩된 인증키 모두 입력할 수 있습니다. 나머지 DB 접속 항목은 [.env.example](.env.example)을 참고하세요. `.env`는 Git에 포함되지 않습니다.
