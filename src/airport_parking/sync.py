@@ -34,6 +34,7 @@ CONTEXT_HEADERS = ["id", "source", "kind", "fetched_at", "scope", "records"]
 # The collectors use ordinary INSERT identities and append-only transactions.
 REMOTE_SCRIPT = r'''
 import csv
+csv.field_size_limit(64 * 1024 * 1024)
 from datetime import datetime, timezone
 import json
 from pathlib import Path

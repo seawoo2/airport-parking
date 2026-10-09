@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -16,6 +17,39 @@ from test_server_sync import archive_bytes, ZERO
 
 
 class ContextTests(unittest.TestCase):
+    def test_remote_export_counts_large_context_records(self):
+        stdout = SimpleNamespace(buffer=io.BytesIO())
+        large_records = json.dumps([{"flightId": "KE001", "scheduleDateTime": "202610101200"}] * 5000)
+        self.assertGreater(len(large_records), 131072)
+        def psql(command, **kwargs):
+            sql = command[-1]
+            if "to_regclass" in sql:
+                return SimpleNamespace(stdout=b"t\n")
+            if "LOCK TABLE" in sql:
+                self.assertIn("context_snapshots IN SHARE MODE", sql)
+                return SimpleNamespace(stdout=json.dumps({"parking_id": 0, "passenger_batch_id": 0,
+                                                         "context_id": 1, "source_instance": "test-db"}).encode())
+            output = io.StringIO(newline="")
+            writer = csv.writer(output)
+            if "FROM context_snapshots" in sql:
+                writer.writerow(sync.CONTEXT_HEADERS)
+                writer.writerow([1, "data.go.kr:15112968", "flights", "2026-10-09T00:00:00+00:00",
+                                 '{"target_date":"2026-10-10","direction":"arrival"}', large_records])
+            else:
+                writer.writerow(sync.HEADERS["parking.csv" if "FROM parking_observations" in sql else "passenger_forecasts.csv"])
+            kwargs["stdout"].write(output.getvalue().encode())
+            return SimpleNamespace()
+        original_limit = csv.field_size_limit(131072)
+        try:
+            with patch.object(sync.subprocess, "run", side_effect=psql), patch("sys.stdout", stdout):
+                exec(sync.REMOTE_SCRIPT, {"REMOTE_DIR": "/unused", "CURSORS": ZERO, "EXPECTED_SOURCE": None})
+        finally:
+            csv.field_size_limit(original_limit)
+        with zipfile.ZipFile(io.BytesIO(stdout.buffer.getvalue())) as exported:
+            manifest = json.loads(exported.read("manifest.json"))
+            self.assertEqual(manifest["rows"]["context_snapshots.csv"], 1)
+            self.assertEqual(manifest["to_cursors"]["context_id"], 1)
+
     def test_pages_preserve_all_items(self):
         with patch.object(api, "request_page", side_effect=[({}, {"totalCount": 2, "items": {"item": {"fid": "1"}}}),
                                                            ({}, {"totalCount": 2, "items": [{"fid": "2"}]})]):
