@@ -84,7 +84,7 @@ class IncrementalTests(unittest.TestCase):
         second = self.download(archive_bytes(lower=checkpoint, upper={"parking_id": 2, "passenger_batch_id": 3},
                                              parking=[parking_row(2)], passengers=[passenger_row(3)]), expected=checkpoint)
         self.assertEqual(second["rows"], {"parking.csv": 1, "passenger_forecasts.csv": 1})
-        self.assertEqual(second["total_rows"], {"parking.csv": 2, "passenger_forecasts.csv": 3})
+        self.assertEqual(second["total_rows"], {"parking.csv": 2, "passenger_forecasts.csv": 3, "context_snapshots.csv": 0})
         # Downloading a delta does not rewrite the full dataset.
         self.assertEqual(sync.read_json(self.output / "latest.json")["dataset_dir"], str(assembled.relative_to(self.output)))
         merged = sync.materialize_dataset(self.output)
@@ -142,7 +142,7 @@ class IncrementalTests(unittest.TestCase):
         checkpoint = {"parking_id": 1, "passenger_batch_id": 2}
         result = self.download(archive_bytes(lower=checkpoint, upper={"parking_id": 2, "passenger_batch_id": 3},
                                             parking=[parking_row(2)], passengers=[passenger_row(3)]), checkpoint)
-        self.assertEqual(result["total_rows"], {"parking.csv": 2, "passenger_forecasts.csv": 3})
+        self.assertEqual(result["total_rows"], {"parking.csv": 2, "passenger_forecasts.csv": 3, "context_snapshots.csv": 0})
         self.assertTrue((old / "parking.csv").exists())
 
     def test_source_change_and_regressed_cursor_fail_without_overwriting(self):
@@ -234,6 +234,8 @@ class RemoteProtocolTests(unittest.TestCase):
         def psql(command, **kwargs):
             sql = command[-1]
             calls.append(sql)
+            if "to_regclass" in sql:
+                return SimpleNamespace(stdout=b"f\n")
             if "LOCK TABLE" in sql:
                 rows.append(parking_row(2))  # previously uncommitted lower identity
                 result = {"parking_id": 3, "passenger_batch_id": 0, "source_instance": "test-db"}
@@ -249,7 +251,7 @@ class RemoteProtocolTests(unittest.TestCase):
 
         with patch.object(sync.subprocess, "run", side_effect=psql), patch("sys.stdout", stdout):
             exec(sync.REMOTE_SCRIPT, {"REMOTE_DIR": "/unused", "CURSORS": ZERO, "EXPECTED_SOURCE": None})
-        self.assertIn("COMMIT", calls[0])
+        self.assertIn("COMMIT", calls[1])
         with zipfile.ZipFile(io.BytesIO(stdout.buffer.getvalue())) as zipped:
             records = list(csv.DictReader(io.StringIO(zipped.read("parking.csv").decode("utf-8"))))
             self.assertEqual([row["id"] for row in records], ["1", "2", "3"])
