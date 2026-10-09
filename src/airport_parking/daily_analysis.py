@@ -12,6 +12,7 @@ import pandas as pd
 
 from airport_parking.features.congestion import TIMEZONE, load_snapshot
 from airport_parking.features.next_day import build_day, build_training, cutoff_for
+from airport_parking.features.context import load_context, coverage
 from airport_parking.models.next_day import evaluate_predictions, fit, write_predictions
 from airport_parking.sync import DEFAULT_CONFIG, DEFAULT_DATA_ROOT, ROOT, atomic_json, config_values, materialize_dataset, store_lock, sync_data, utc_now
 
@@ -61,11 +62,16 @@ def daily_run(data_root=DEFAULT_DATA_ROOT, output_root=DEFAULT_OUTPUT, config_pa
             atomic_json(root / "last_prediction_job.json", job)
             return job
         try:
+            context = load_context(Path(dataset))
             required_after = cutoff - pd.Timedelta(minutes=5)
-            rows = build_day(parking, passengers, local_day, cutoff_time, required_after)
+            rows = build_day(parking, passengers, local_day, cutoff_time, required_after, context=context)
+            for name, status in coverage(rows).items():
+                if status["available_rows"] < status["total_rows"]:
+                    LOG.warning("Context input missing at forecast cutoff: %s (%s/%s rows available)",
+                                name, status["available_rows"], status["total_rows"])
             if (rows.anchor_age_minutes > 20).any():
                 raise ValueError("Some parking anchors are more than 20 minutes old at issue cutoff")
-            training, skipped = build_training(parking, passengers, cutoff, cutoff_time)
+            training, skipped = build_training(parking, passengers, cutoff, cutoff_time, context=context)
             with tempfile.TemporaryDirectory(prefix=".analysis-", dir=root) as temporary:
                 staging = Path(temporary).resolve()
                 if not staging.is_relative_to(root):
@@ -87,6 +93,9 @@ def daily_run(data_root=DEFAULT_DATA_ROOT, output_root=DEFAULT_OUTPUT, config_pa
                     "prediction_rows": len(forecasts), "lots": rows.lot_name.nunique(),
                     "input_parking_rows": quality["parking_rows"],
                     "assessment_status": assessment["status"], "selected_model": assessment["selected_model"],
+                    "feature_schema_version": 2, "context_input_rows": len(context),
+                    "context_coverage": coverage(rows),
+                    "context_used_by_model": bool(forecasts.context_used_by_model.iloc[0]),
                 }
                 atomic_json(folder / "manifest.json", manifest)
                 lines = ["# 익일 시간대별 주차 혼잡도 예측", "",
@@ -95,6 +104,9 @@ def daily_run(data_root=DEFAULT_DATA_ROOT, output_root=DEFAULT_OUTPUT, config_pa
                          "- 정답: 시간대 평균·최대·최소 혼잡률. 시간대별 서로 다른 10분 구간 4개 이상 필요",
                          f"- 승객예고 배치: {manifest['forecast_batch_id']}, 수집 시각: {manifest['forecast_fetched_at']}",
                          f"- 모델: {assessment['selected_model']}, 판정: {assessment['status']}", "",
+                         f"- 운항·공휴일 입력 가용성: {manifest['context_coverage']}",
+                         f"- 새 입력을 모델이 실제 사용했는지: {manifest['context_used_by_model']}",
+                         f"- 새 입력 모델 준비: {assessment['context_model_reason']}", "",
                          "현재값 유지와 전일·전주 동일 시간 기준 예측을 학습 모델과 비교합니다.",
                          "학습 데이터가 부족하면 전주·전일 동일 시간, 현재값 순으로 사용할 수 있는 기준값을 사용합니다.",
                          "예측 주차 대수는 발행 시점의 면수를 적용한 추정치이며 미래 면수 변경을 보장하지 않습니다.", "",

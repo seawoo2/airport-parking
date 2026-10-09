@@ -13,7 +13,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from airport_parking.features.congestion import TIMEZONE, timestamps
-from airport_parking.features.next_day import CATEGORICAL, NUMERIC, FEATURES, hourly_truth
+from airport_parking.features.next_day import CATEGORICAL, NUMERIC, BASE_NUMERIC, FEATURES, hourly_truth
+from airport_parking.features.context import coverage
 from airport_parking.models.congestion import metrics
 from airport_parking.sync import atomic_json
 
@@ -22,11 +23,11 @@ PREDICTED = ["predicted_ratio", "predicted_max_ratio", "predicted_min_ratio"]
 STATISTICS = ("mean", "max", "min")
 
 
-def estimator(kind):
+def estimator(kind, use_context=False):
     numeric = Pipeline([("missing", SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True)),
                         ("scale", StandardScaler())])
     inputs = ColumnTransformer([
-        ("numeric", numeric, NUMERIC),
+        ("numeric", numeric, NUMERIC if use_context else BASE_NUMERIC),
         ("categorical", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL),
     ])
     model = Ridge(alpha=10) if kind == "ridge" else RandomForestRegressor(
@@ -57,7 +58,9 @@ def statistic_metrics(frame, predicted, busy_threshold=0.9):
 
 def fit(dataset, output, busy_threshold=0.9):
     assessment = {"status": "insufficient_data", "selected_model": "seasonal", "labeled_rows": len(dataset),
-                  "minimum_days": {"train": 14, "validation": 7, "test": 7}, "reasons": []}
+                  "minimum_days": {"train": 14, "validation": 7, "test": 7}, "reasons": [],
+                  "context_coverage": coverage(dataset), "context_model_eligible": False,
+                  "context_model_reason": "Need sufficient historical context at the original forecast cutoff"}
     models = {"persistence": None, "seasonal": None}
     if dataset.empty:
         assessment["reasons"].append("No eligible next-day hourly training examples")
@@ -86,6 +89,17 @@ def fit(dataset, output, busy_threshold=0.9):
         return assessment, None
     for name in ("ridge", "random_forest"):
         models[name] = estimator(name).fit(training[FEATURES], training[TARGETS])
+    context_days = {}
+    for name, frame in zip(("train", "validation", "test"), (training, validation, testing)):
+        available = frame[["holiday_available", "flight_arrival_available", "flight_departure_available"]].eq(1).all(axis=1)
+        complete = available.groupby(frame.target_date).all()
+        context_days[name] = int(complete.sum())
+    assessment["context_complete_days_by_split"] = context_days
+    if all(context_days[name] >= minimum for name, minimum in (("train", 14), ("validation", 7), ("test", 7))):
+        assessment["context_model_eligible"] = True
+        assessment["context_model_reason"] = "Context candidates compared with original models on identical date splits"
+        for name in ("ridge", "random_forest"):
+            models[name + "_context"] = estimator(name, use_context=True).fit(training[FEATURES], training[TARGETS])
     assessment["validation_metrics"] = {name: statistic_metrics(validation, forecast(name, validation, model), busy_threshold)
                                         for name, model in models.items()}
     assessment["selection_rule"] = "Mean of mean/max/min validation MAE; equal weights"
@@ -99,7 +113,8 @@ def fit(dataset, output, busy_threshold=0.9):
         assessment["test_metrics"][name] = statistic_metrics(testing, values, busy_threshold)
     results.to_csv(output / "backtest_predictions.csv", index=False, encoding="utf-8-sig")
     assessment.update(status="evaluated", selected_model=selected)
-    fitted = estimator(selected).fit(dataset[FEATURES], dataset[TARGETS]) if selected in ("ridge", "random_forest") else None
+    fitted = (estimator(selected.removesuffix("_context"), use_context=selected.endswith("_context"))
+              .fit(dataset[FEATURES], dataset[TARGETS])) if selected.removesuffix("_context") in ("ridge", "random_forest") else None
     return assessment, fitted
 
 
@@ -117,6 +132,7 @@ def write_predictions(rows, assessment, model, output, generated_at):
     data["predicted_max_busy"] = data.predicted_max_ratio >= 0.9
     data["model"] = kind
     data["prediction_kind"] = "learned" if model is not None else "baseline"
+    data["context_used_by_model"] = model is not None and kind.endswith("_context")
     data["generated_at"] = generated_at
     data["target_definition"] = "hourly_mean_max_min_ratio"
     data.to_csv(output / "predictions.csv", index=False, encoding="utf-8-sig")
@@ -151,6 +167,7 @@ def evaluate_predictions(predictions_path, parking, as_of, minimum_samples=4, pe
         "missing_rows": int((checked.evaluation_status == "missing").sum()),
         "coverage_pct": len(valid) / len(checked) * 100, "minimum_observation_slots": minimum_samples,
         "target_definition": "hourly_mean_max_min_ratio",
+        "context_coverage": coverage(original),
     }
     if len(valid):
         summary["forecast_metrics"] = statistic_metrics(valid, valid[PREDICTED].to_numpy())
@@ -159,6 +176,12 @@ def evaluate_predictions(predictions_path, parking, as_of, minimum_samples=4, pe
                                for hour, group in valid.groupby(valid.target_hour.dt.tz_convert(TIMEZONE).dt.hour)}
         summary["per_lot"] = {name: statistic_metrics(group, group[PREDICTED].to_numpy())
                               for name, group in valid.groupby("lot_name")}
+        summary["context_groups"] = {}
+        for column in ("is_holiday", "is_day_off", "flight_arrival_available", "flight_departure_available", "context_used_by_model"):
+            if column in valid:
+                summary["context_groups"][column] = {
+                    str(value): {"rows": len(group), "forecast_metrics": statistic_metrics(group, group[PREDICTED].to_numpy())}
+                    for value, group in valid.groupby(column, dropna=False)}
     if persist:
         # Forecasts are immutable. Evaluation is replaced atomically as labels arrive.
         temporary = predictions_path.parent / ".evaluation.csv.tmp"

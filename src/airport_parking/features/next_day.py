@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from airport_parking.features.congestion import TIMEZONE
+from airport_parking.features.context import NUMERIC as CONTEXT_NUMERIC, context_for_day
 
 CATEGORICAL = ["lot_name", "terminal", "lot_type"]
 NUMERIC = [
@@ -16,6 +17,8 @@ NUMERIC = [
     "arrival", "departure", "arrival_previous_2h", "departure_next_2h",
     "arrival_cumulative", "departure_cumulative", "arrival_daily", "departure_daily",
 ]
+BASE_NUMERIC = NUMERIC.copy()
+NUMERIC = NUMERIC + CONTEXT_NUMERIC
 FEATURES = CATEGORICAL + NUMERIC
 
 
@@ -66,10 +69,11 @@ def forecast_batch(passengers, target_day, cutoff, required_after=None):
     raise ValueError(f"No complete D+1 passenger batch available by {cutoff.isoformat()} for {target_day}")
 
 
-def build_day(parking, passengers, issue_day, cutoff_time="17:15", required_after=None):
+def build_day(parking, passengers, issue_day, cutoff_time="17:15", required_after=None, context=None):
     cutoff = cutoff_for(issue_day, cutoff_time)
     target_day = date.fromisoformat(str(issue_day)) + timedelta(days=1)
     batch = forecast_batch(passengers, target_day, cutoff, required_after)
+    context_features = context_for_day(context, target_day, cutoff)
     known = parking.loc[(parking.collected_at <= cutoff) & (parking.observed_at <= cutoff)]
     anchors = known.sort_values("collected_at").groupby("lot_name").tail(1)
     anchors = anchors.loc[anchors.total_spaces > 0]
@@ -108,11 +112,12 @@ def build_day(parking, passengers, issue_day, cutoff_time="17:15", required_afte
             row.update(arrival_previous_2h=before.arrival.sum(), departure_next_2h=after.departure.sum(),
                        arrival_cumulative=series.loc[:target].arrival.sum(), departure_cumulative=series.loc[:target].departure.sum(),
                        arrival_daily=series.arrival.sum(), departure_daily=series.departure.sum())
+            row.update(context_features[terminal].loc[target].to_dict())
             rows.append(row)
     return pd.DataFrame(rows)
 
 
-def build_training(parking, passengers, as_of, cutoff_time="17:15", minimum_samples=4):
+def build_training(parking, passengers, as_of, cutoff_time="17:15", minimum_samples=4, context=None):
     """Train only from forecasts and hourly truths available at deployment time."""
     days = sorted(set(passengers.target_hour.dt.tz_convert(TIMEZONE).dt.date))
     truth = hourly_truth(parking, as_of, minimum_samples)
@@ -123,7 +128,7 @@ def build_training(parking, passengers, as_of, cutoff_time="17:15", minimum_samp
             continue
         try:
             rows = build_day(parking, passengers, issue_day, cutoff_time,
-                             required_after=cutoff_for(issue_day, cutoff_time) - pd.Timedelta(minutes=5))
+                             required_after=cutoff_for(issue_day, cutoff_time) - pd.Timedelta(minutes=5), context=context)
         except ValueError as exc:
             skipped.append({"target_date": str(target_day), "reason": str(exc)})
             continue
