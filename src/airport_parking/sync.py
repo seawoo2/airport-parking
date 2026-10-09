@@ -27,11 +27,14 @@ HEADERS = {
     "passenger_forecasts.csv": ["batch_id", "source", "fetched_at", "target_date", "day_offset", "phase", "changed_count", "target_hour", "terminal", "direction", "expected_passengers"],
 }
 
+CONTEXT_HEADERS = ["id", "source", "kind", "fetched_at", "scope", "records"]
+
 # Fence current writers briefly before capturing identity limits. Without a fence,
 # an earlier allocated identity committed later could be skipped by MAX(id).
 # The collectors use ordinary INSERT identities and append-only transactions.
 REMOTE_SCRIPT = r'''
 import csv
+csv.field_size_limit(64 * 1024 * 1024)
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -52,6 +55,12 @@ SELECT json_build_object(
  'source_instance', (SELECT system_identifier::text FROM pg_control_system()) || ':' ||
                     (SELECT oid::text FROM pg_database WHERE datname = current_database()));
 COMMIT;"""
+exists = subprocess.run(base + psql + ["-A", "-t", "-c", "SELECT to_regclass('public.context_snapshots') IS NOT NULL"], cwd=REMOTE_DIR, capture_output=True, check=True, timeout=180).stdout.strip() == b"t"
+if exists:
+    fence = fence.replace("passenger_forecasts IN SHARE MODE", "passenger_forecasts, context_snapshots IN SHARE MODE")
+    fence = fence.replace(" 'source_instance',", " 'context_id', COALESCE((SELECT MAX(id) FROM context_snapshots), 0),\n 'source_instance',")
+elif CURSORS.get("context_id", 0):
+    raise RuntimeError("Previously synchronized context table is missing")
 started = datetime.now(timezone.utc).isoformat()
 result = subprocess.run(base + ["-e", "PGOPTIONS=-c timezone=UTC"] + psql + ["-A", "-t", "-c", fence],
                         cwd=REMOTE_DIR, capture_output=True, check=True, timeout=180)
@@ -65,10 +74,18 @@ queries = {
  "parking.csv": f"SELECT id, source, lot_name, observed_at, collected_at, occupied_spaces, total_spaces FROM parking_observations WHERE id > {CURSORS['parking_id']} AND id <= {upper['parking_id']} ORDER BY id",
  "passenger_forecasts.csv": f"SELECT f.batch_id, b.source, b.fetched_at, b.target_date, b.day_offset, b.phase, b.changed_count, f.target_hour, f.terminal, f.direction, f.expected_passengers FROM passenger_forecasts f JOIN passenger_forecast_batches b ON b.id = f.batch_id WHERE b.id > {CURSORS['passenger_batch_id']} AND b.id <= {upper['passenger_batch_id']} ORDER BY b.id, f.target_hour, f.terminal, f.direction",
 }
+if exists:
+    upper_context = upper["context_id"]
+    lower_context = CURSORS.get("context_id", 0)
+    if upper_context < lower_context:
+        raise RuntimeError("Context cursor moved backwards")
+    queries["context_snapshots.csv"] = f"SELECT id,source,kind,fetched_at,scope,records FROM context_snapshots WHERE id > {lower_context} AND id <= {upper_context} ORDER BY id"
 manifest = {"format_version": 2, "mode": "incremental", "started_at_utc": started,
             "timezone": "UTC", "from_cursors": CURSORS,
             "to_cursors": {key: upper[key] for key in CURSORS},
             "source_instance": upper["source_instance"], "rows": {}}
+if exists:
+    manifest["to_cursors"]["context_id"] = upper["context_id"]
 with tempfile.TemporaryDirectory(prefix="airport-parking-export-") as temp:
     folder = Path(temp)
     for name, query in queries.items():
@@ -234,6 +251,7 @@ def open_store(root):
         CREATE TABLE IF NOT EXISTS passengers (
             batch_id INTEGER, target_hour TEXT, terminal TEXT, direction TEXT, payload TEXT NOT NULL,
             PRIMARY KEY(batch_id, target_hour, terminal, direction));
+        CREATE TABLE IF NOT EXISTS contexts (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         if meta_get(connection, "initialized") is None:
@@ -247,6 +265,11 @@ def open_store(root):
                     if manifest.get("mode") == "incremental":
                         raise ValueError("Cannot bootstrap from a delta without its cumulative store")
                     counts, maxima = ingest(connection, folder, manifest.get("rows", pointer.get("rows")))
+                    if (folder / "context_snapshots.csv").exists():
+                        upper_context = manifest.get("cursors", {}).get("context_id", 0)
+                        counts["context_snapshots.csv"] = ingest_context(
+                            connection, folder, manifest.get("rows", pointer.get("rows")), 0, upper_context)
+                        maxima["context_id"] = upper_context
                     if manifest.get("source_instance"):
                         meta_set(connection, "source_instance", manifest["source_instance"])
                     stamp = pointer.get("last_synced_at_utc", pointer.get("downloaded_at_utc"))
@@ -269,6 +292,7 @@ def store_status(connection):
         "total_rows": {
             "parking.csv": connection.execute("SELECT COUNT(*) FROM parking").fetchone()[0],
             "passenger_forecasts.csv": connection.execute("SELECT COUNT(*) FROM passengers").fetchone()[0],
+            "context_snapshots.csv": connection.execute("SELECT COUNT(*) FROM contexts").fetchone()[0],
         },
     }
 
@@ -304,9 +328,12 @@ def sync_data(host: str, key: Path, remote_dir: str, output_dir: Path) -> dict:
             snapshot = staging / "delta"
             snapshot.mkdir()
             with zipfile.ZipFile(archive) as zipped:
-                if sorted(zipped.namelist()) != sorted([*HEADERS, "manifest.json"]):
+                names = [*HEADERS, "manifest.json"]
+                if "context_snapshots.csv" in zipped.namelist():
+                    names.append("context_snapshots.csv")
+                if sorted(zipped.namelist()) != sorted(names):
                     raise ValueError("Export archive contains unexpected files")
-                for name in (*HEADERS, "manifest.json"):
+                for name in names:
                     with zipped.open(name) as incoming, (snapshot / name).open("wb") as target:
                         shutil.copyfileobj(incoming, target)
             manifest = read_json(snapshot / "manifest.json")
@@ -315,7 +342,9 @@ def sync_data(host: str, key: Path, remote_dir: str, output_dir: Path) -> dict:
             if manifest.get("from_cursors") != cursors:
                 raise ValueError("Delta starting cursors do not match local state")
             upper = manifest["to_cursors"]
-            if set(upper) != set(cursors) or any(type(upper[key]) is not int or upper[key] < value for key, value in cursors.items()):
+            if ("context_snapshots.csv" in names) != ("context_id" in upper):
+                raise ValueError("Context file and cursor must both be present")
+            if set(upper) not in (set(cursors), set(cursors) | {"context_id"}) or any(type(upper[key]) is not int or upper[key] < cursors.get(key, 0) for key in upper):
                 raise ValueError("Invalid or regressed server cursors")
             if not manifest.get("source_instance") or source is not None and manifest["source_instance"] != source:
                 raise ValueError("Server database identity changed")
@@ -327,6 +356,10 @@ def sync_data(host: str, key: Path, remote_dir: str, output_dir: Path) -> dict:
                 for name, cursor_name in (("parking.csv", "parking_id"), ("passenger_forecasts.csv", "passenger_batch_id")):
                     if upper[cursor_name] > cursors[cursor_name] and maxima[cursor_name] != upper[cursor_name]:
                         raise ValueError("Delta is missing its final committed identity: " + name)
+                if "context_id" in upper:
+                    if "context_snapshots.csv" not in names:
+                        raise ValueError("Context export is missing")
+                    added["context_snapshots.csv"] = ingest_context(connection, snapshot, manifest["rows"], cursors.get("context_id", 0), upper["context_id"])
                 stamp = utc_now().isoformat()
                 revision = meta_get(connection, "data_revision", 0) + (1 if sum(added.values()) else 0)
                 meta_set(connection, "cursors", upper)
@@ -345,6 +378,37 @@ def sync_data(host: str, key: Path, remote_dir: str, output_dir: Path) -> dict:
             return result
 
 
+def ingest_context(connection, folder, counts, lower, upper):
+    csv.field_size_limit(64 * 1024 * 1024)
+    added = count = 0
+    maximum = lower
+    seen = set()
+    with (folder / "context_snapshots.csv").open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source, strict=True)
+        if reader.fieldnames != CONTEXT_HEADERS:
+            raise ValueError("Invalid context columns")
+        for row in reader:
+            identity = int(row["id"])
+            if set(row) != set(CONTEXT_HEADERS) or any(value is None for value in row.values()):
+                raise ValueError("Incomplete context row")
+            if not lower < identity <= upper or identity in seen:
+                raise ValueError("Invalid context identity")
+            seen.add(identity)
+            stamp = datetime.fromisoformat(row["fetched_at"])
+            if stamp.tzinfo is None or row["kind"] not in ("flights", "holidays"):
+                raise ValueError("Invalid context timestamp or kind")
+            if not isinstance(json.loads(row["scope"]), dict) or not isinstance(json.loads(row["records"]), list):
+                raise ValueError("Invalid context JSON")
+            payload = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            connection.execute("INSERT INTO contexts VALUES (?,?)", (identity, payload))
+            maximum = max(maximum, identity)
+            count += 1
+            added += 1
+    if count != counts.get("context_snapshots.csv") or maximum != upper:
+        raise ValueError("Incomplete context export")
+    return added
+
+
 def materialize_dataset(data_root: Path) -> Path:
     """Assemble all locally accumulated rows; never contact the server."""
     root = data_root.expanduser().resolve()
@@ -354,7 +418,7 @@ def materialize_dataset(data_root: Path) -> Path:
             pointer = read_json(root / "latest.json")
             if pointer.get("kind") == "materialized" and pointer.get("data_revision") == status["data_revision"]:
                 folder = checked_snapshot(root, pointer)
-                if all((folder / name).is_file() for name in (*HEADERS, "manifest.json")):
+                if all((folder / name).is_file() for name in (*HEADERS, "context_snapshots.csv", "manifest.json")):
                     return folder
         if status["total_rows"]["parking.csv"] == 0:
             raise ValueError("No locally synchronized parking data; synchronize first")
@@ -365,10 +429,11 @@ def materialize_dataset(data_root: Path) -> Path:
             folder = staging / "dataset"
             folder.mkdir()
             queries = {"parking.csv": "SELECT payload FROM parking ORDER BY id",
-                       "passenger_forecasts.csv": "SELECT payload FROM passengers ORDER BY batch_id, target_hour, terminal, direction"}
+                       "passenger_forecasts.csv": "SELECT payload FROM passengers ORDER BY batch_id, target_hour, terminal, direction",
+                       "context_snapshots.csv": "SELECT payload FROM contexts ORDER BY id"}
             for name, query in queries.items():
                 with (folder / name).open("w", encoding="utf-8", newline="") as output:
-                    writer = csv.DictWriter(output, fieldnames=HEADERS[name])
+                    writer = csv.DictWriter(output, fieldnames=CONTEXT_HEADERS if name == "context_snapshots.csv" else HEADERS[name])
                     writer.writeheader()
                     for payload, in connection.execute(query):
                         writer.writerow(json.loads(payload))
